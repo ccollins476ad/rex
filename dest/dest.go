@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Type specifies the broad category of the destination sink.
 type Type int
 
 const (
@@ -22,7 +23,8 @@ const (
 )
 
 const (
-	unsetType   = Type(-1) // Not a valid type.
+	unsetType = Type(-1) // Not a valid type.
+
 	defaultPerm = 0644
 )
 
@@ -39,8 +41,11 @@ func init() {
 	for dt, name := range typeNames {
 		nameTypeMap[name] = Type(dt)
 	}
+
 }
 
+// Dest is a fully self-contained description of a data sink. Use the Open
+// method to acquire a corresponding writer for the Dest.
 type Dest struct {
 	Type        Type
 	ID          string
@@ -52,6 +57,9 @@ type Dest struct {
 	Create      bool
 }
 
+// makeDest builds a default-initialized Dest struct. The result is not usable
+// for writing data, but it is a suitable initial state for parsing a
+// destination specifier string.
 func makeDest() Dest {
 	return Dest{
 		Type: unsetType,
@@ -59,6 +67,8 @@ func makeDest() Dest {
 	}
 }
 
+// Open builds a writer associated with the receiver Dest struct. The writer's
+// behavior is specified by the Dest's fields.
 func (d *Dest) Open() (io.Writer, error) {
 	switch d.Type {
 	case TypeFD:
@@ -78,6 +88,7 @@ func (d *Dest) Open() (io.Writer, error) {
 	}
 }
 
+// openFD creates a writer for a Dest whose type is TypeFD.
 func (d *Dest) openFD() (io.Writer, error) {
 	fd, err := strconv.Atoi(d.ID)
 	if err != nil {
@@ -92,6 +103,7 @@ func (d *Dest) openFD() (io.Writer, error) {
 	return output.NewBestEffortWriter(fd), nil
 }
 
+// openFile creates a writer for a Dest whose type is TypeFile.
 func (d *Dest) openFile() (io.Writer, error) {
 	mode := unix.O_WRONLY
 	if d.Create {
@@ -116,6 +128,7 @@ func (d *Dest) openFile() (io.Writer, error) {
 	return output.NewBestEffortWriter(fd), nil
 }
 
+// openFifo creates a writer for a Dest whose type is TypeFifo.
 func (d *Dest) openFifo() (io.Writer, error) {
 	if d.Create {
 		err := unix.Mkfifo(d.ID, d.Perm)
@@ -137,6 +150,7 @@ func (d *Dest) openFifo() (io.Writer, error) {
 	return output.NewBestEffortWriter(fd), nil
 }
 
+// openProc creates a writer for a Dest whose type is TypeProc.
 func (d *Dest) openProc() (io.Writer, error) {
 	cmd := exec.Command(d.ID, d.Args...)
 
@@ -156,6 +170,8 @@ func (d *Dest) openProc() (io.Writer, error) {
 	return w, nil
 }
 
+// configureFD configures a file descriptor with settings specified in the
+// receiver Dest struct's fields.
 func (d *Dest) configureFD(fd int) error {
 	if d.NonBlocking {
 		err := setNonblocking(fd)
@@ -174,6 +190,7 @@ func (d *Dest) configureFD(fd int) error {
 	return nil
 }
 
+// setNonblocking puts the given file descriptor in non-blocking mode.
 func setNonblocking(fd int) error {
 	flags, err := unix.FcntlInt(uintptr(fd), syscall.F_GETFL, 0)
 	if err != nil {
@@ -188,6 +205,8 @@ func setNonblocking(fd int) error {
 	return nil
 }
 
+// setBufSize configures the pipe buffer size of the given file descriptor.
+// When applied to a non-pipe file descriptor, the behavior is unsepcified.
 func setBufSize(fd int, size int) error {
 	_, err := unix.FcntlInt(uintptr(fd), syscall.F_SETPIPE_SZ, size)
 	if err != nil {

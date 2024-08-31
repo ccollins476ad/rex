@@ -6,13 +6,16 @@ import (
 	"strings"
 )
 
+// Example dest specifier string:
+// type=fifo,id=/tmp/myfifo,nonblocking,bufsize=102400,create
+
 type parser struct {
 	d       Dest
 	keyVals map[string]string
 }
 
-// type=fifo:id=/var/log/vserial/fifo:nonblocking:bufsize=102400:create
-
+// Parse parses the given dest specifier string, returning the resulting Dest
+// on success, error on failure.
 func Parse(s string) (*Dest, error) {
 	p := parser{
 		d:       makeDest(),
@@ -27,17 +30,20 @@ func Parse(s string) (*Dest, error) {
 	return &p.d, nil
 }
 
+// Parse parses the given dest specifier string, writing the result to the
+// parser's internal dest field. It returns an error on parse failure.
 func (p *parser) parse(s string) error {
 	fail := func(err error) error {
 		return fmt.Errorf("invalid dest: dest=[%s]: %w", s, err)
 	}
 
-	tokens := strings.Split(s, ",")
+	// Dest fields are separated by commas.
+	fields := strings.Split(s, ",")
 
-	for _, t := range tokens {
-		err := p.parseToken(t)
+	for _, t := range fields {
+		err := p.parseField(t)
 		if err != nil {
-			return fail(fmt.Errorf("parse failure: token=[%s]: %w", t, err))
+			return fail(fmt.Errorf("parse failure: field=[%s]: %w", t, err))
 		}
 	}
 
@@ -52,18 +58,25 @@ func (p *parser) parse(s string) error {
 	return nil
 }
 
-func (p *parser) parseToken(token string) error {
+// parseField parses a single dest specifier field. On success, it populates
+// the parser's internal dest struct accordingly.
+func (p *parser) parseField(field string) error {
 	var err error
-	k, v := splitEquals(token)
-	if v != "" {
-		err = p.parseKeyVal(k, v)
+
+	// Some fields have `k=v` notation, others have `x`. Determine which type
+	// of field this is by checking for the presence of an `=` character.
+	parts := strings.SplitN(field, "=", 2)
+	if len(parts) == 2 {
+		err = p.parseKeyVal(parts[0], parts[1])
 	} else {
-		err = p.parseStandalone(token)
+		err = p.parseStandalone(field)
 	}
 	return err
 }
 
 func (p *parser) parseKeyVal(k string, v string) error {
+	// Don't allow the same key to be specified twice in a dest specifier
+	// string.
 	if p.keyVals[k] == "" {
 		p.keyVals[k] = v
 	} else if p.keyVals[k] != v {
@@ -113,8 +126,8 @@ func (p *parser) parseKeyVal(k string, v string) error {
 	}
 }
 
-func (p *parser) parseStandalone(token string) error {
-	switch token {
+func (p *parser) parseStandalone(field string) error {
+	switch field {
 	case "nonblocking":
 		p.d.NonBlocking = true
 		return nil
@@ -128,14 +141,6 @@ func (p *parser) parseStandalone(token string) error {
 		return nil
 
 	default:
-		return fmt.Errorf("unrecognized token")
+		return fmt.Errorf("unrecognized field")
 	}
-}
-
-func splitEquals(token string) (string, string) {
-	parts := strings.SplitN(token, "=", 2)
-	if len(parts) == 1 {
-		return parts[0], ""
-	}
-	return parts[0], parts[1]
 }

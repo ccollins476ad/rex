@@ -17,6 +17,8 @@ func parseArgs() (*Env, error) {
 	readBufSize := flag.Int("b", 64*1024, "read buffer size")
 	flag.Parse()
 
+	// All remaining arguments specify destinations. Parse each and append
+	// their corresponding writers to ws.
 	var ws []io.Writer
 	for _, arg := range flag.Args() {
 		fail := func(err error) (*Env, error) {

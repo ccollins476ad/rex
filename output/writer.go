@@ -2,6 +2,7 @@ package output
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"syscall"
@@ -9,6 +10,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// BestEffortWriter implements io.Writer. It writes to a unix file descriptor,
+// treating EAGAIN and EWOULDBLOCK results as successes. That is, if the
+// destination file reaches capacity before the full write completes, this
+// function discards the unwritten data and reports success.
 type BestEffortWriter struct {
 	fd int
 }
@@ -21,29 +26,39 @@ func NewBestEffortWriter(fd int) *BestEffortWriter {
 
 func (w *BestEffortWriter) writeOnce(p []byte) (int, error) {
 	n, err := unix.Write(w.fd, p)
-	if n < 0 {
-		n = 0
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-			err = nil
-		}
+	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		// Zero bytes written due to full buffer. Treat these errors as
+		// successes.
+		return len(p), nil
 	}
-	return n, err
+	if err != nil {
+		// Fatal error.
+		return 0, err
+	}
+
+	// Some bytes written. Not a failure.
+	return n, nil
 }
 
-func (w *BestEffortWriter) Write(b []byte) (n int, err error) {
+func (w *BestEffortWriter) Write(b []byte) (int, error) {
+	var n int
+
 	for n < len(b) {
-		var n2 int
-		n2, err = w.writeOnce(b[n:])
+		n2, err := w.writeOnce(b[n:])
 		n += n2
-		if err != nil || n2 <= 0 {
-			break
+
+		if err != nil {
+			return n, err
 		}
 	}
 
-	return
+	return n, nil
 }
 
-type GoWriter struct {
+// AsyncWriter implements io.Writer. It performs nonblocking writes in a
+// dedicated goroutine. It is not possible to determine the results of a write
+// operation.
+type AsyncWriter struct {
 	sync.Mutex
 	w      io.Writer
 	inChan chan []byte
@@ -51,127 +66,160 @@ type GoWriter struct {
 	err    error
 }
 
-func NewGoWriter(ctx context.Context, w io.Writer) *GoWriter {
-	gw := &GoWriter{
+func NewAsyncWriter(ctx context.Context, w io.Writer) *AsyncWriter {
+	aw := &AsyncWriter{
 		w:      w,
 		inChan: make(chan []byte),
 	}
 
 	go func() {
-		iterNoErr := func() {
+		// Consume from the input channel and write the contents until we
+		// encounter an error.
+		for aw.Err() == nil {
 			select {
 			case <-ctx.Done():
-				gw.setErr(ctx.Err())
+				aw.stop(ctx.Err())
 
-			case b, ok := <-gw.inChan:
-				if ok {
-					gw.writeNow(b)
+			case b := <-aw.inChan:
+				err := aw.writeNow(b)
+				if err != nil {
+					aw.stop(err)
 				}
 			}
 		}
 
-		for gw.Err() == nil {
-			iterNoErr()
-		}
-		for b := range gw.inChan {
-			gw.writeNow(b)
+		// The writer is done (in the stopped state). Complete all pending
+		// writes, then return.
+		for b := range aw.inChan {
+			aw.writeNow(b)
 		}
 	}()
 
-	return gw
+	return aw
 }
 
-func (gw *GoWriter) Write(b []byte) (int, error) {
-	err := gw.acquire()
+// Write schedules a write operation to run in the writer's goroutine. It
+// returns an error if the writer is not accepting new writes (i.e., in the
+// stopped state), otherwise it indicates success. The success return values
+// can be misleading, since the scheduled write has not actually completed yet.
+func (aw *AsyncWriter) Write(b []byte) (int, error) {
+	err := aw.acquire()
 	if err != nil {
 		return 0, err
 	}
 
-	gw.inChan <- b
+	aw.inChan <- b
 	return len(b), nil
 }
 
-func (gw *GoWriter) Err() error {
-	gw.Lock()
-	defer gw.Unlock()
+// Err returns the error that put the writer in the stopped state, or nil if
+// the writer is still active.
+func (aw *AsyncWriter) Err() error {
+	aw.Lock()
+	defer aw.Unlock()
 
-	return gw.err
+	return aw.err
 }
 
-func (gw *GoWriter) acquire() error {
-	gw.Lock()
-	defer gw.Unlock()
+// Wait blocks until all scheduled writes have completed.
+func (aw *AsyncWriter) Wait() {
+	aw.wg.Wait()
+}
 
-	if gw.err != nil {
-		return gw.err
+// acquire records the presence of a pending write operation. It must be called
+// before attempting to schedule a write. It returns an error if the writer has
+// been stopped.
+func (aw *AsyncWriter) acquire() error {
+	aw.Lock()
+	defer aw.Unlock()
+
+	// Reject the write operation if the writer is in the stopped state.
+	if aw.err != nil {
+		return aw.err
 	}
 
-	gw.wg.Add(1)
+	aw.wg.Add(1)
 	return nil
 }
 
-func (gw *GoWriter) release() {
-	gw.wg.Done()
+// release performs the inverse of acquire(). It is called when a scheduled
+// write has completed.
+func (aw *AsyncWriter) release() {
+	aw.wg.Done()
 }
 
-func (gw *GoWriter) setErr(err error) error {
-	gw.Lock()
-	defer gw.Unlock()
-
-	if gw.err != nil {
-		// Already stopped.
-		return gw.err
+// stop puts the writer into the stopped state if it wasn't already so. It
+// returns true if the writer was previously active, false otherwise (no-op).
+// After being put into the stopped state, the writer rejects new write
+// requests, but continues running until all pending requests have completed.
+func (aw *AsyncWriter) stop(err error) bool {
+	if err == nil {
+		panic(fmt.Sprintf("%T.stop() called with err==nil", aw))
 	}
 
-	gw.err = err
+	aw.Lock()
+	defer aw.Unlock()
 
+	if aw.err != nil {
+		// Already stopped.
+		return false
+	}
+
+	// Don't accept any new writes.
+	aw.err = err
+
+	// Close the input channel after all pending writes have completed.
 	go func() {
-		gw.wg.Wait()
-		close(gw.inChan)
+		aw.wg.Wait()
+		close(aw.inChan)
 	}()
 
-	return nil
+	return true
 }
 
-func (gw *GoWriter) writeNow(b []byte) {
-	defer gw.release()
-	_, err := gw.w.Write(b)
-	if err != nil {
-		gw.setErr(err)
-	}
+// writeNow writes the given bytes in the current goroutine.
+func (aw *AsyncWriter) writeNow(b []byte) error {
+	defer aw.release() // Acquired by Write() call in parent goroutine.
+	_, err := aw.w.Write(b)
+	return err
 }
 
+// SyncWriter implements io.Writer. It duplicates output to multiple writers in
+// parallel.
 type SyncWriter struct {
-	gws []*GoWriter
+	aws []*AsyncWriter
 }
 
 func NewSyncWriter(ctx context.Context, ws []io.Writer) *SyncWriter {
-	var gws []*GoWriter
+	var aws []*AsyncWriter
 	for _, w := range ws {
-		gws = append(gws, NewGoWriter(ctx, w))
+		aws = append(aws, NewAsyncWriter(ctx, w))
 	}
 
 	return &SyncWriter{
-		gws: gws,
+		aws: aws,
 	}
 }
 
 // Write writes the given bytes to each of the sync writer's constituent
 // writers in parallel, then waits for all the writes to complete.
 func (sw *SyncWriter) Write(b []byte) (int, error) {
-	for _, gw := range sw.gws {
-		n, err := gw.Write(b)
+	for _, aw := range sw.aws {
+		n, err := aw.Write(b)
 		if err != nil {
 			return n, err
 		}
 	}
 
+	// Wait for writes to complete.
 	sw.wait()
+
 	return len(b), nil
 }
 
+// wait blocks until all scheduled writes have completed.
 func (sw *SyncWriter) wait() {
-	for _, gw := range sw.gws {
-		gw.wg.Wait()
+	for _, aw := range sw.aws {
+		aw.Wait()
 	}
 }
